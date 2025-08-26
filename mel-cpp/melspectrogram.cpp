@@ -8,7 +8,10 @@ extern "C" {
     #include <libswresample/swresample.h>
 }
 #include <opencv2/opencv.hpp>
-
+#include<onnxruntime_cxx_api.h>
+#include <iostream>
+#include <fstream>
+#include <string>
 typedef cv::Mat PCM;
 
 cv::Mat generate_sine(int sr, float freq, float duration) {
@@ -460,22 +463,250 @@ public:
 
         mel_spec_db=mel_spec_db.t();
 
-       
-       
         
         return mel_spec_db;
 
     }
 };
 
+std::vector<std::string> labels = {"read-aloud", "clap", "discuss", "noise", "single"};
+
+std::vector<float> softmax(const std::vector<float>& logits) {
+    std::vector<float> probabilities(logits.size());
+    float sum_exp = 0.0f;
+
+    //std::cout << "--- Softmax 函數內部偵錯 ---" << std::endl;
+
+    // 計算所有 logits 的指數和
+    for (size_t i = 0; i < logits.size(); ++i) {
+        float logit = logits[i];
+        // 檢查 logit 是否為 NaN 或 Inf
+        if (std::isnan(logit)) {
+            std::cerr << "偵錯：Softmax 輸入 logit[" << i << "] 是 NaN。" << std::endl;
+            // 如果輸入是 NaN，則直接返回 NaN 向量
+            std::fill(probabilities.begin(), probabilities.end(), std::numeric_limits<float>::quiet_NaN());
+            return probabilities;
+        }
+        if (std::isinf(logit)) {
+            std::cerr << "偵錯：Softmax 輸入 logit[" << i << "] 是 Inf。" << std::endl;
+            // 對於 Inf 輸入，結果通常也是 Inf 或 NaN，這裡直接返回 NaN 向量
+            std::fill(probabilities.begin(), probabilities.end(), std::numeric_limits<float>::quiet_NaN());
+            return probabilities;
+        }
+
+        float exp_logit = std::exp(logit);
+        //std::cout << "  logit[" << i << "]: " << logit << ", exp(logit): " << exp_logit << std::endl;
+        sum_exp += exp_logit;
+    }
+
+    //std::cout << "  所有 exp(logit) 的總和 (sum_exp): " << sum_exp << std::endl;
+
+    // 檢查 sum_exp 是否為 0 或 NaN
+    if (sum_exp == 0.0f || std::isnan(sum_exp) || std::isinf(sum_exp)) {
+        std::cerr << "偵錯：Softmax 計算中 sum_exp 為 " << sum_exp << "。這會導致除以零或 NaN/Inf 結果。" << std::endl;
+        // 如果 sum_exp 有問題，則返回 NaN 向量
+        std::fill(probabilities.begin(), probabilities.end(), std::numeric_limits<float>::quiet_NaN());
+        return probabilities;
+    }
+
+    // 計算每個類別的機率
+    for (size_t i = 0; i < logits.size(); ++i) {
+        probabilities[i] = std::exp(logits[i]) / sum_exp;
+    }
+    //std::cout << "--- Softmax 函數內部偵錯結束 ---" << std::endl;
+    return probabilities;
+}
+
+std::pair<int,float> parse_model_output(const std::vector<Ort::Value>& ort_outputs) {
+    if (ort_outputs.empty()) {
+        std::cerr << "錯誤：模型沒有輸出。" << std::endl;
+        return std::make_pair(0,0);
+    }
+
+    const Ort::Value& output_tensor = ort_outputs[0];
+    std::vector<int64_t> output_shape = output_tensor.GetTensorTypeAndShapeInfo().GetShape();
+
+    // 這裡檢查形狀是否符合 [1, 5]
+    if (output_shape.size() != 2 || output_shape[0] != 1 || output_shape[1] != 5) {
+        std::cerr << "錯誤：輸出張量形狀不符合預期的 1x5 分類任務。" << std::endl;
+        std::cerr << "輸出形狀：[";
+        for (size_t i = 0; i < output_shape.size(); ++i) {
+            std::cerr << output_shape[i] << (i == output_shape.size() - 1 ? "" : "x");
+        }
+        std::cerr << "]" << std::endl;
+        return std::make_pair(0,0);
+    }
+
+    const float* raw_output_data = output_tensor.GetTensorData<float>();
+
+    std::vector<float> class_scores(5);
+    for (int i = 0; i < 5; ++i) {
+        class_scores[i] = raw_output_data[i];
+    }
+
+    // --- 關鍵偵錯點：打印模型的原始輸出 ---
+    // std::cout << "\n--- 模型原始輸出 (Logits/Scores) 偵錯 ---" << std::endl;
+    // for (int i = 0; i < class_scores.size(); ++i) {
+    //     std::cout << "  類別 " << i << " 的原始分數: " << class_scores[i] << std::endl;
+    // }
+    // std::cout << "--- 模型原始輸出偵錯結束 ---\n" << std::endl;
+    // --- 結束關鍵偵錯點 ---
+
+    std::vector<float> probabilities = softmax(class_scores);
+
+    float max_probability = 0.0f;
+    int predicted_class_index = -1;
+
+    // 檢查機率向量是否包含 NaN
+    bool has_nan_prob = false;
+    for (float prob : probabilities) {
+        if (std::isnan(prob)) {
+            has_nan_prob = true;
+            break;
+        }
+    }
+
+    if (has_nan_prob) {
+        std::cerr << "錯誤：機率計算結果包含 NaN。無法確定預測類別。" << std::endl;
+        predicted_class_index = -1; // 表示無法確定
+    } else {
+        for (int i = 0; i < probabilities.size(); ++i) {
+            if (probabilities[i] > max_probability) {
+                max_probability = probabilities[i];
+                predicted_class_index = i;
+            }
+        }
+    }
 
 
+    //std::cout << "每個類別的機率：" << std::endl;
+    for (int i = 0; i < probabilities.size(); ++i) {
+        // 如果機率是 NaN，則輸出 "NaN"
+        if (std::isnan(probabilities[i])) {
+            std::cout << "  類別 " << i << ": NaN%" << std::endl;
+        }
+        // } else {
+        //     std::cout << "  類別 " << i << ": " << probabilities[i] * 100.0f << "%" << std::endl;
+        // }
+    }
+
+    //std::cout << "---" << std::endl;
+    // if (predicted_class_index != -1) {
+    //     std::cout << "預測的類別索引是: " << predicted_class_index << std::endl;
+    //     std::cout << "預測的機率是: " << max_probability * 100.0f << "%" << std::endl;
+    // } else {
+    //     std::cout << "無法確定預測類別，因為機率包含 NaN。" << std::endl;
+    // }
+    // std::cout << "---" << std::endl;
+    std::pair<int,float> result=std::make_pair(predicted_class_index,max_probability);
+    return result;
+
+}
+
+std::pair<int,float> main_inference_process(const std::string& onnx_path_name, PCM pcm, Generate_mel_spectrogram& mel_generator)
+{
+    // 初始化 ONNX Runtime
+    Ort::Env env(ORT_LOGGING_LEVEL_ERROR, "sound_classification-onnx");
+    Ort::SessionOptions session_options;
+    session_options.SetGraphOptimizationLevel(ORT_ENABLE_BASIC);
+    Ort::Session session(env, onnx_path_name.c_str(), session_options);
+
+    Ort::AllocatorWithDefaultOptions allocator;
+
+    // 取得輸入輸出節點名稱
+    size_t numInputNodes = session.GetInputCount();
+    size_t numOutputNodes = session.GetOutputCount();
+
+    std::vector<std::string> input_node_names_str;
+    std::vector<std::string> output_node_names_str;
+    input_node_names_str.reserve(numInputNodes);
+    output_node_names_str.reserve(numOutputNodes);
+
+    int input_w = 0;
+    int input_h = 0;
+    for (size_t i = 0; i < numInputNodes; i++) {
+        auto input_name = session.GetInputNameAllocated(i, allocator);
+        input_node_names_str.push_back(input_name.get());
+        Ort::TypeInfo input_type_info = session.GetInputTypeInfo(i);
+        auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+        auto input_dims = input_tensor_info.GetShape();
+
+        input_w = input_dims[3];
+        input_h = input_dims[2];
+        // std::cout << "Input " << i << " format: NxCxHxW = " 
+        //           << input_dims[0] << "x" << input_dims[1] << "x" 
+        //           << input_dims[2] << "x" << input_dims[3] << std::endl;
+    }
+
+    Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
+    auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+    auto output_dims = output_tensor_info.GetShape();
+    int class_num = output_dims[1];
+
+    // std::cout << "Output format: BxClass_num = " 
+    //           << output_dims[0] << "x" << output_dims[1] << std::endl;
+
+    for (size_t i = 0; i < numOutputNodes; i++) {
+        auto out_name = session.GetOutputNameAllocated(i, allocator);
+        output_node_names_str.push_back(out_name.get());
+    }
+    
+   
+
+    // ===== 生成 Mel Spectrogram =====
+    cv::Mat mel_spectrogram = mel_generator.forward(pcm);
+
+    int mel_T = mel_spectrogram.rows;
+    int mel_F = mel_spectrogram.cols;
+    
+
+    //create input tensor
+    const std::array<const char*, 2> inputNames = { input_node_names_str[0].c_str(),input_node_names_str[1].c_str() };
+    const std::array<const char*, 1> outNames = { output_node_names_str[0].c_str() };
+    auto allocator_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+
+    int tpixels1 = pcm.cols;
+    std::array<int64_t, 4> input_shape_info1{1,1, 1,tpixels1};
+
+    int tpixels2 = mel_T* mel_F;
+    std::array<int64_t, 4> input_shape_info2{1,1,mel_T,mel_F};
+
+    Ort::Value input_tensor_1 = Ort::Value::CreateTensor<float>(allocator_info, pcm.ptr<float>(), tpixels1, input_shape_info1.data(), input_shape_info1.size());
+    Ort::Value input_tensor_2 = Ort::Value::CreateTensor<float>(allocator_info, mel_spectrogram.ptr<float>(), tpixels2, input_shape_info2.data(), input_shape_info2.size());
+    
+    // Create a vector to hold all input Ort::Value objects
+    std::vector<Ort::Value> input_tensors;
+    input_tensors.push_back(std::move(input_tensor_1)); // Use std::move for efficiency if input_tensor_1 won't be used again
+    input_tensors.push_back(std::move(input_tensor_2)); // Use std::move for efficiency if input_tensor_2 won't be used again
+
+    // Pass the data pointer of the vector and its size to session->Run
+    std::vector<Ort::Value> ort_outputs;
+    try {
+        ort_outputs = session.Run(Ort::RunOptions{ nullptr },
+                                inputNames.data(),       // Array of input names
+                                input_tensors.data(),    // Pointer to the array of input tensors
+                                input_tensors.size(),    // Number of input tensors
+                                outNames.data(),         // Array of output names
+                                outNames.size());        // Number of output tensors
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
+    }
+
+    std::pair<int,float> pred_result = parse_model_output(ort_outputs);
+
+
+
+
+
+    return pred_result;
+}
 
 
 
 int main(int argc, char** argv) {
-    const char *fname = "/home/zonekey/project/audio_classification/teacher_ac1.mp3";
-    std::vector<int16_t> samples = load_pcm_using_ffmpeg(fname);
+    const char *fname = "/home/zonekey/project/audio_classification/726_16k.wav";
+    std::vector<int16_t> samples = load_pcm_using_ffmpeg(fname,40*60);
     printf("got %zu samples, with %.03f seconds\n", samples.size(), samples.size() / 16000.0);    
 
 
@@ -490,18 +721,42 @@ int main(int argc, char** argv) {
     cv::Mat signal = generate_sine(sr, freq, duration);
 
     Generate_mel_spectrogram mel_generator(16000,512,64,false,0.0);
-
-    cv::Mat w=mel_generator.forward(signal);
-
+    std::string onnx_path_name="/home/zonekey/project/audio_classification/waveform_logmel_cnn.onnx";
+    std::ofstream outputFile("726_c.txt");
     
-    
+    int time=0;
     while (head < tail) {
         // PCM pcm(ptr_sample + head, ptr_sample + head + 16000);
         PCM pcm(1, 16000, CV_16S, (void*)(ptr_sample + head));
         //printf("got %zu samples with %.03f seconds \n",pcm.size(),pcm.size()/16000);
+       
+        cv::Mat pcm_float_mat(1, pcm.cols, CV_32F);
+        float* pcm_float_ptr = pcm_float_mat.ptr<float>();
+        for (int i = 0; i < pcm.cols; ++i) {
+            int16_t sample_value = pcm.at<int16_t>(0,head + i);
+            pcm_float_ptr[i] = static_cast<float>(sample_value) / 32768.0f;
+        }
+        
+        std::pair<int,float> pred_result =main_inference_process(onnx_path_name,pcm_float_mat,mel_generator);
+        if (outputFile.is_open()) {
+            int pred_class = pred_result.first;
+            float score = pred_result.second;
+            // 計算浮點數時間，並將其格式化
+            float start_time_float = static_cast<float>(time);
+            float end_time_float = static_cast<float>(time + 1);
+            std::string category = labels[pred_class];
+
+            // 使用 std::fixed 和 std::setprecision 來格式化輸出
+            outputFile << std::fixed << std::setprecision(3) << start_time_float << "\t"
+                       << std::fixed << std::setprecision(3) << end_time_float << "\t"
+                       << category << " \n \n"; 
+        }
         head += 16000;
+        time+=1;
         
     }
+    outputFile.close();
+   
 
     return 0;
 }
